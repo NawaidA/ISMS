@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_10255_isms.ISMSEnrichCI</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>ISMSEnrichCI</name>
+        <script><![CDATA[var ISMSEnrichCI = Class.create();
+var DATE_FORMAT = 'yyyy-MM-dd';
+var START_DATE_DAYS_AGO = 5;
+var END_DATE_DAYS_AFTER = -5;
+var SECURITY_TAG = 'ISMS – CI is part of pentest';
+
+ISMSEnrichCI.prototype = {
+	initialize: function() {
+		this.host = gs.getProperty('x_ingmb_isms.isms.host.name');
+		this.endpoint = "";
+		this.startDate = new GlideDate();
+		this.endDate = new GlideDate();
+		this.startDate.setValue(gs.daysAgo(START_DATE_DAYS_AGO));
+		this.endDate.setValue(gs.daysAgo(END_DATE_DAYS_AFTER));
+	},
+
+	getEnrichment: function(cis, parentTask, implementationID){
+		for(var i = 0; i < cis.length; i++){
+			gs.info('getting CIS');
+			var ci = new GlideRecord('cmdb_ci');
+			gs.info(cis[i]);
+			ci.get(cis[i]);
+
+			if(ci.isValidRecord()){
+				gs.info('Valid Record');
+				//var ciName = this.toHtmlEntities(ci.getValue('name'));
+				//var ciName = ci.getValue('name').replaceAll(' ', '');
+				var ciName = ci.getValue('name');
+				ciName = gs.urlEncode(ciName);
+				gs.info(ciName);
+				var enrichment = this.serverCall(ciName, this.startDate.getByFormat(DATE_FORMAT), this.endDate.getByFormat(DATE_FORMAT));
+				this.createCIEnrichment(enrichment, ci, implementationID, parentTask);
+			}
+		}
+
+	},
+
+	serverCall: function(ci, start, end){
+		try {
+			gs.debug('Starting call to CI Enrichment for ' + ci);
+			var r = new sn_ws.RESTMessageV2('x_ingmb_isms.ISMS API', 'GET Security Testing');
+			r.setStringParameterNoEscape('startDate', start);
+			r.setStringParameterNoEscape('endDate', end);
+			r.setStringParameterNoEscape('ciName', ci);
+			r.setStringParameterNoEscape('host', this.host);
+
+			var response = r.execute();
+			this.endpoint = r.getEndpoint() + '';
+			var responseBody = response.getBody();
+			var httpStatus = response.getStatusCode();
+			gs.info(responseBody);
+			gs.info(httpStatus);
+			return responseBody;
+		}
+		catch(ex) {
+			var message = ex.message;
+		}
+	},
+
+	createCIEnrichment: function(result, ci, implementationID, sir){
+		gs.info(result);
+		var enrichments = JSON.parse(result);
+		gs.info(enrichments);
+
+		if(enrichments.length == 0){
+			var secInc = new GlideRecord('sn_si_incident');
+			secInc.get(sir);
+			if(secInc.isValidRecord()){
+				secInc.work_notes  = 'There are no pentests for ' + ci.getValue('name') + ' between ' + this.startDate.getByFormat(DATE_FORMAT) + ' and ' + this.endDate.getByFormat(DATE_FORMAT) + ' on ISMS';
+				secInc.update();
+			}
+			return;
+		}
+		for(var enrichment in enrichments){
+			var enrichmentGR = new GlideRecord('sn_sec_cmn_ci_enrichment_result');
+			enrichmentGR.addQuery('reference_ci', ci.getUniqueValue());
+			enrichmentGR.addQuery('parent', enrichments[enrichment].TestRunID);
+			enrichmentGR.query();
+
+			if(!enrichmentGR.next()){
+				enrichmentGR.initialize();
+				enrichmentGR.name = enrichments[enrichment]["TestRunName"];
+				enrichmentGR.reference_ci = ci.getUniqueValue();
+				enrichmentGR.raw_data = JSON.stringify(enrichments[enrichment], null, 4);
+				enrichmentGR.vendor = implementationID;
+				enrichmentGR.summary = JSON.stringify(enrichments[enrichment], null, 4);
+				enrichmentGR.parent = enrichments[enrichment].TestRunID;
+				enrichmentGR.external_link = 'https://' + this.host;
+				enrichmentGR.insert();
+				this.addSecurityTag(enrichmentGR.getUniqueValue(), 'sn_sec_cmn_ci_enrichment_result');
+			}else{
+				enrichmentGR.retrieval_date = new GlideDateTime().getDisplayValue();
+				enrichmentGR.update();
+			}
+			this.addSecurityTag(sir, 'sn_si_incident');
+		}
+
+		//Automatic closure of alerts with Acceptance CIs under pentesting and not Sec Mon L1
+		if(ci.getValue('u_environment') == 'ACCEPTANCE'  || ci.getValue('u_environment') == 'Acceptance'){
+			var secIncRecord = new GlideRecord('sn_si_incident');
+			secIncRecord.get(sir);
+			if(secIncRecord.isValidRecord()){
+				if(secIncRecord.getDisplayValue('assignment_group') != 'Security Monitoring L1' && secIncRecord.getValue('contact_type') == 'siem'){
+					secIncRecord.u_regulatory_reporting = 'no';
+					secIncRecord.close_code = 'Security test';
+					secIncRecord.close_notes = 'Automatically closing the Security Alert as the CI is of a PEN TEST and the CI is non production';
+					secIncRecord.state = 3;
+					secIncRecord.substate = 26;
+					secIncRecord.closed_by = gs.getUserID();
+					secIncRecord.update();
+				}
+			}
+		}
+	},
+
+	toHtmlEntities: function(string){
+		return string.replace(/./gm, function (s) {
+			return (s.match(/[a-z0-9]+/i)) ? s : "&#" + s.charCodeAt(0) + ";";
+		});
+	},
+
+	/*
+    * Adds Security Tags to SIR
+    * @param obs - observable record
+    * @param type - type of observable
+    */
+	addSecurityTag: function (recordID, table) {
+		var securityTag = new GlideRecord('sn_sec_cmn_security_tag');
+		securityTag.get('name', SECURITY_TAG);
+
+		if(securityTag.isValidRecord()){
+			var appliedTag = new GlideRecord('sn_sec_cmn_applied_security_tag');
+			appliedTag.addQuery('security_tag', securityTag.getUniqueValue());
+			appliedTag.addQuery('record_id', recordID);
+			appliedTag.addQuery('record_table', table);
+			appliedTag.query();
+
+			if (!appliedTag.next()) {
+				appliedTag = new GlideRecord("sn_sec_cmn_applied_security_tag");
+				appliedTag.initialize();
+				appliedTag.security_tag = securityTag.getUniqueValue();
+				appliedTag.record_id = recordID;
+				appliedTag.record_table = table;
+				appliedTag.insert();
+			}
+		}
+	},
+
+	type: 'ISMSEnrichCI'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>nawaid.anjum</sys_created_by>
+        <sys_created_on>2021-04-30 08:47:40</sys_created_on>
+        <sys_id>1b85cf0e2f7f20102d00d5ccf699b6f7</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ISMSEnrichCI</sys_name>
+        <sys_package display_value="ISMS" source="x_10255_isms">fd458b0e2f7f20102d00d5ccf699b68e</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="ISMS">fd458b0e2f7f20102d00d5ccf699b68e</sys_scope>
+        <sys_update_name>sys_script_include_1b85cf0e2f7f20102d00d5ccf699b6f7</sys_update_name>
+        <sys_updated_by>nawaid.anjum</sys_updated_by>
+        <sys_updated_on>2021-04-30 08:47:40</sys_updated_on>
+    </sys_script_include>
+</record_update>
